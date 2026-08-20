@@ -12,11 +12,17 @@
 // output configuration settings that affect the compilation.
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use bindgen::Builder;
 
 fn main() -> anyhow::Result<()> {
+    // Point bindgen/clang-sys at the libclang shipped with the Zephyr SDK (if any) before
+    // triggering any clang-sys initialization below.  This avoids relying on the host
+    // environment to have libclang installed and discoverable on its own.
+    configure_libclang_path();
+
     // Determine which version of Clang we linked with.
     let version = bindgen::clang_version();
     println!("Clang version: {:?}", version);
@@ -122,6 +128,56 @@ fn main() -> anyhow::Result<()> {
         .expect("Couldn't write bindings!");
 
     Ok(())
+}
+
+/// Detect and configure a libclang usable by bindgen (via clang-sys).
+///
+/// If the user has already set `LIBCLANG_PATH`, that choice is respected and left untouched.
+/// Otherwise, if the Zephyr SDK is available (SDK 1.0+ ships an LLVM toolchain including
+/// libclang), probe its `llvm` directory for a usable libclang and point `LIBCLANG_PATH` at it.
+/// This makes bindgen work out-of-the-box for anyone using Zephyr SDK 1.0+, without requiring a
+/// separately installed libclang on the host.
+fn configure_libclang_path() {
+    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_SDK_INSTALL_DIR");
+
+    // Respect an explicit user override.
+    if env::var_os("LIBCLANG_PATH").is_some() {
+        return;
+    }
+
+    let Some(sdk_dir) = env::var_os("ZEPHYR_SDK_INSTALL_DIR") else {
+        return;
+    };
+    let sdk_dir = PathBuf::from(sdk_dir);
+
+    // Directories within the SDK's LLVM toolchain that could hold a libclang shared library,
+    // depending on host OS (Linux/macOS use `llvm/lib`, Windows uses `llvm/bin` for DLLs).
+    let candidate_dirs = [sdk_dir.join("llvm").join("lib"), sdk_dir.join("llvm").join("bin")];
+
+    for dir in candidate_dirs {
+        if find_libclang(&dir) {
+            println!(
+                "cargo:warning=Using libclang from Zephyr SDK at {}",
+                dir.display()
+            );
+            env::set_var("LIBCLANG_PATH", &dir);
+            return;
+        }
+    }
+}
+
+/// Returns true if `dir` contains a file that looks like a libclang shared library.
+fn find_libclang(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("libclang.") || name.starts_with("libclang-")
+    })
 }
 
 trait BuilderExt {
